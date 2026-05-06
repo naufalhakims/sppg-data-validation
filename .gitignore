@@ -1,0 +1,4 @@
+outputs/
+selenium_chrome_profile/
+__pycache__/
+.venv/
