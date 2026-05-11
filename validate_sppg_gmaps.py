@@ -537,7 +537,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Validasi Nama_SPPG, longitude, dan latitude ke Google Maps memakai Selenium."
     )
-    parser.add_argument("--input", default="sppg_jawa_timur (1).csv", help="Path CSV sumber.")
+    parser.add_argument("--input", default="./data/sppg_jawa_timur (1).csv", help="Path CSV sumber.")
     parser.add_argument("--output", default="", help="Path CSV hasil. Default: outputs/sppg_validated_<timestamp>.csv")
     parser.add_argument("--profile-dir", default="selenium_chrome_profile", help="Folder profil Chrome untuk menyimpan sesi/consent.")
     parser.add_argument("--headless", action="store_true", help="Jalankan Chrome tanpa UI. Tidak disarankan untuk Google Maps.")
