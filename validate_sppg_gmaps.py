@@ -1,4 +1,5 @@
 import argparse
+import base64
 import csv
 import math
 import re
@@ -8,6 +9,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
 
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
@@ -27,6 +29,8 @@ RESULT_COLUMNS = [
     "GMaps_Reviews",
     "GMaps_Foto",
     "GMaps_Foto_URL",
+    "GMaps_Photo_File",
+    "GMaps_Photo_Save_Error",
     "GMaps_Distance_Meter",
     "GMaps_Name_Score",
     "GMaps_Source",
@@ -39,6 +43,9 @@ RESULT_COLUMNS = [
 
 
 COORD_RE = re.compile(r"^-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?$")
+BLANK_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
 SPPG_LIKE_PHRASES = [
     "sppg",
     "satuan pelayanan pemenuhan gizi",
@@ -145,6 +152,55 @@ def parse_float(value):
         return float(str(value).strip())
     except (TypeError, ValueError):
         return None
+
+
+def slugify(value, max_length=80):
+    value = normalize_keyword_text(value)
+    value = re.sub(r"[^a-z0-9]+", "_", value).strip("_")
+    if not value:
+        value = "tanpa_nama"
+    return value[:max_length]
+
+
+def make_blank_image(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(base64.b64decode(BLANK_PNG_BASE64))
+
+
+def download_image(url, path, timeout):
+    request = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            )
+        },
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with urlopen(request, timeout=timeout) as response:
+        path.write_bytes(response.read())
+
+
+def save_place_photo(row_number, row, place, args):
+    photo_dir = Path(args.photo_dir)
+    photo_dir.mkdir(parents=True, exist_ok=True)
+
+    filename_base = f"{row_number:05d}_{slugify(row.get('Nama_SPPG', ''))}"
+    photo_url = place.get("photo_url", "")
+    if place.get("photo_status") == "ADA" and photo_url:
+        photo_path = photo_dir / f"{filename_base}.jpg"
+        try:
+            download_image(photo_url, photo_path, args.photo_timeout)
+            return str(photo_path), ""
+        except Exception as exc:
+            blank_path = photo_dir / f"{filename_base}_blank.png"
+            make_blank_image(blank_path)
+            return str(blank_path), f"Gagal menyimpan foto Google Maps: {clean_text(str(exc))[:200]}"
+
+    blank_path = photo_dir / f"{filename_base}_blank.png"
+    make_blank_image(blank_path)
+    return str(blank_path), ""
 
 
 def build_driver(args):
@@ -453,7 +509,7 @@ def choose_best_candidate(row, places, args):
     return best_place
 
 
-def evaluate(row, place, args):
+def evaluate(row, place, args, photo_file="", photo_save_error=""):
     source_lat = parse_float(row.get("Latitude"))
     source_lon = parse_float(row.get("Longitude"))
     expected_name = row.get("Nama_SPPG", "")
@@ -472,8 +528,8 @@ def evaluate(row, place, args):
         errors.append("Nama/alamat kandidat tidak mengandung SPPG atau Satuan Pelayanan Pemenuhan Gizi")
     if score < args.name_threshold:
         errors.append(f"Nama tidak cocok dengan CSV (score {score:.2f})")
-    if place["photo_status"] == "TIDAK ADA" and int(place.get("review_count") or 0) == 0:
-        errors.append("Tidak ada foto dan 0 review")
+    if place["photo_status"] != "ADA" or not place.get("photo_url"):
+        errors.append("Foto Google Maps tidak terdeteksi")
     if distance is None:
         errors.append("Koordinat tempat dari Google Maps tidak terdeteksi")
     elif distance > args.distance_threshold_m:
@@ -490,6 +546,8 @@ def evaluate(row, place, args):
         "GMaps_Reviews": str(place.get("review_count", 0)),
         "GMaps_Foto": place["photo_status"],
         "GMaps_Foto_URL": place["photo_url"],
+        "GMaps_Photo_File": photo_file,
+        "GMaps_Photo_Save_Error": photo_save_error,
         "GMaps_Distance_Meter": "" if distance is None else f"{distance:.1f}",
         "GMaps_Name_Score": f"{score:.2f}",
         "GMaps_Source": place["source"],
@@ -524,6 +582,10 @@ def output_header_fields(output_path):
         return reader.fieldnames or []
 
 
+def default_photo_dir_for_output(output_path):
+    return output_path.parent / f"{output_path.stem}_photos"
+
+
 def prepare_writer(output_path, fieldnames, append):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(output_path, "a" if append else "w", encoding="utf-8-sig", newline="")
@@ -537,8 +599,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Validasi Nama_SPPG, longitude, dan latitude ke Google Maps memakai Selenium."
     )
-    parser.add_argument("--input", default="./data/sppg_jawa_timur (1).csv", help="Path CSV sumber.")
+    parser.add_argument("--input", default="sppg_jawa_timur (1).csv", help="Path CSV sumber.")
     parser.add_argument("--output", default="", help="Path CSV hasil. Default: outputs/sppg_validated_<timestamp>.csv")
+    parser.add_argument("--photo-dir", default="", help="Folder penyimpanan foto. Default: <nama_output>_photos.")
+    parser.add_argument("--photo-timeout", type=int, default=30, help="Timeout download foto Google Maps per file.")
     parser.add_argument("--profile-dir", default="selenium_chrome_profile", help="Folder profil Chrome untuk menyimpan sesi/consent.")
     parser.add_argument("--headless", action="store_true", help="Jalankan Chrome tanpa UI. Tidak disarankan untuk Google Maps.")
     parser.add_argument("--delay", type=float, default=4.0, help="Jeda setelah membuka halaman Google Maps.")
@@ -561,6 +625,8 @@ def main():
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = Path("outputs") / f"sppg_validated_{timestamp}.csv"
+    if not args.photo_dir:
+        args.photo_dir = str(default_photo_dir_for_output(output_path))
 
     source_fields, rows = read_rows(input_path)
     required = {"Nama_SPPG", "Longitude", "Latitude"}
@@ -606,19 +672,44 @@ def main():
                 if lat is None or lon is None:
                     result["Status"] = "TIDAK VALID"
                     result["GMaps_Error"] = "Longitude/Latitude CSV tidak valid"
+                    result["GMaps_Photo_File"], result["GMaps_Photo_Save_Error"] = save_place_photo(
+                        row_number,
+                        row,
+                        {"photo_status": "TIDAK ADA", "photo_url": ""},
+                        args,
+                    )
                 else:
                     places = scrape_search_candidates(driver, row, args)
                     place = choose_best_candidate(row, places, args)
-                    result.update(evaluate(row, place, args))
+                    photo_file, photo_save_error = save_place_photo(row_number, row, place, args)
+                    result.update(evaluate(row, place, args, photo_file, photo_save_error))
             except TimeoutException:
                 result["Status"] = "TIDAK VALID"
                 result["GMaps_Error"] = "Timeout saat membuka Google Maps"
+                result["GMaps_Photo_File"], result["GMaps_Photo_Save_Error"] = save_place_photo(
+                    row_number,
+                    row,
+                    {"photo_status": "TIDAK ADA", "photo_url": ""},
+                    args,
+                )
             except WebDriverException as exc:
                 result["Status"] = "TIDAK VALID"
                 result["GMaps_Error"] = f"Selenium error: {clean_text(str(exc))[:300]}"
+                result["GMaps_Photo_File"], result["GMaps_Photo_Save_Error"] = save_place_photo(
+                    row_number,
+                    row,
+                    {"photo_status": "TIDAK ADA", "photo_url": ""},
+                    args,
+                )
             except Exception as exc:
                 result["Status"] = "TIDAK VALID"
                 result["GMaps_Error"] = f"Error tidak terduga: {clean_text(str(exc))[:300]}"
+                result["GMaps_Photo_File"], result["GMaps_Photo_Save_Error"] = save_place_photo(
+                    row_number,
+                    row,
+                    {"photo_status": "TIDAK ADA", "photo_url": ""},
+                    args,
+                )
 
             output_row = dict(row)
             output_row.update(result)
